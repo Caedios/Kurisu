@@ -371,9 +371,7 @@ async def _execute_tools_turn():
 
 ## 四、Agent Harness
 `Agent` 类蜕变为轻量外壳，负责生命周期资源的组装与管理：
-
-1. 一等公民事件流： `prompt_stream`
-
+### 1. 一等公民事件流： `prompt_stream`
 调用方可以直接以异步迭代器的方式消费微内核发射的每一个纯只读事件：
 
 ```python
@@ -391,7 +389,7 @@ async for event in agent.prompt_stream("帮我重构这个模块"):
 > `MessageUpdate` 对应 `_assistant_turn` 中实现流式输出 Chunk
 > `ToolExecutionStart` 对应 `_execute_tools_turn` 中执行工具 Tool
 
-2. 观察者模式： `subscribe` 与 `_notify` 广播管道
+### 2. 观察者模式： `subscribe` 与 `_notify` 广播管道
 
 对标 Pi 的 `AgentSession.subscribe` 与 Tau 的 `AgentHarness.subscribe`，`Agent` 实现了轻量只读观察者管道：
 
@@ -459,8 +457,8 @@ asyncio.run(main())
 5. **全触点覆盖**：在 `UserInputHook` 阻断退出、 `AgentStartHook` 阻断退出、 `prompt_stream` 主事件循环、以及上下文压缩写回 4 大触点统一触发广播。
 > **防坑：** 如果只在 `prompt_stream` 主事件循环中广播，那么在其他阶段没有办法退出了，得保证监听器在任意阶段都可以收到结束信号
 
+### 3. 便利门面： `run`
 
-3. 便利门面： `run`
 经典阻塞式调用，内部纯粹消费 `prompt_stream` 并在 `AgentEnd` 时提取 `final_text` 返回：
 
 ```python
@@ -474,7 +472,8 @@ async def run(self, user_input: str) -> str | None:
 
 > 这里不清楚为什么单独提出 `run` ，难道不是在 `一等公民事件流` 中已经介绍过了吗？
 
-4. 协作式中断： `abort`
+### 4. 协作式中断： `abort`
+
 通过 `agent.abort()` 触发内部 `CancellationToken.cancel()` ，流式推理与工具执行车间将在下一个检查点安全终止，并完成断头结果自动合成与原子落盘，**绝不向 Session 写入半截脏数据**。
 
 > 设计目的：使得系统能干净、安全地停下来，不泄露资源或者操作执行一半
