@@ -165,20 +165,22 @@
 
 1. **冲突 1 解释： `gather` 要协程， `yield` 只能生成器**
 目前想实现的功能伪代码如下：
-   ```python
-   async def run_tool(name: str):
-       print(name)
-       asyncio.sleep(1)
-       yield print("完成进度 50%")
-       asyncio.sleep(1)
-       print(name)
-   async def main():
-       await asyncio.gather(run_tool("a"), run_tool("b"))
-       
- asyncio.run(main())
-   ```
-   矛盾的根源：**`asyncio.gather()` 只接受协程**，而 **`yield` 让函数变成异步生成器**，两者不兼容。
+```python
+import asyncio
+async def run_tool(name: str):
+    print(name)
+    asyncio.sleep(1)
+    yield print("完成进度 50%")
+    asyncio.sleep(1)
+    print(name)
+async def main():
+    await asyncio.gather(run_tool("a"), run_tool("b"))
+asyncio.run(main())
+```
+   
+   矛盾的根源：** `asyncio.gather()` 只接受协程**，而 ** `yield` 让函数变成异步生成器**，两者不兼容。
    **作者的解决方式**：把「并发执行」和「流式输出」拆到两层——
+   
    ```python
    async def run_tool(name: str, queue: asyncio.Queue):
        print(name + " start")
@@ -214,12 +216,64 @@
    ```
 
 2. **冲突 2 解释： `asyncio.Queue` 是单线程，工具池要求多线程**
-目前想实现的功能伪代码如下：
+目前想实现的功能伪代码如下（当前代码没有报错，不清楚什么原因）：
 ```python
 async def main():
 	queue = asyncio.Queue()
+	errors = []
 	
+	def worker():
+		try:
+			queue.put({"from": threading.current_thread()})
+		except Exception as e:
+			errors.append(e)
+			print("catch exception", e)
 	
+	threads = [threading.Thread(target=worker) for i in range(10)]
+	for t in threads: t.start()
+	for t in threads: t.join()
+	
+	print(errors)
+	print("queue.qsize() = "queue.qsize())
+
+asyncio.run(main())
 ```
+矛盾的根源： `asyncio.Queue` 是单线程的不能线程阻塞，需要再本线程内拿到 `Future` 凭证才会执行下一步
+- 举例说明 `Queue` 和 `asyncio.Queue` 的区别
+	- 多员工场景，当前单位有多位员工， `Queue` 中存储员工要干的工作，在做某项工作时缺少批准，就休息（阻塞），等批准再干
+	- 单员工场景，当前单位只有一位员工， `asyncio.Queue` 中存储员工要干的工作，在做某项工作时缺少该项目负责人签名，就要了 `Future` 凭证，等项目负责人通知再接着完成，等待过程中不能休息，需要接着做其他工作
 
-
+ **作者的解决方式**：工具都在线程层，编排和消费在协程层，中间用 loop 事件（ `call_soon_threadsafe`  和 `Future` 沟通）
+ - 线程层的 `sync_tool` 完成工作将上报的 `quque.put_nowait` 和 `item` 登记（ `call_soon_threadsafe` ）在协程层的 `run_tool` 里面
+ ```python
+import asyncio
+ import threading
+ def sync_tool(name: str, update):
+     for pct in [25, 50, 75]:
+         update({"name": name, "pct": pct, "thread": threading.current_thread().name})
+     return name + " done"
+ async def run_tool(name, queue, loop):
+     def update(item):
+         loop.call_soon_threadsafe(queue.put_nowait, item)
+     return await asyncio.to_thread(sync_tool, name, update)
+ async def _execute_tools_turn():
+     queue = asyncio.Queue()
+     loop = asyncio.get_running_loop()
+     async def worker():
+         result = await asyncio.gather(
+             run_tool("tool_a", queue, loop),
+             run_tool("tool_b", queue, loop),
+         )
+         await queue.put({"done": True, "result": result})
+     asyncio.create_task(worker())
+     while True:
+         item = await queue.get()
+         if item.get("done"):
+             yield item["result"]
+             break
+         yield item
+ async def main():
+     async for item in _execute_tools_turn():
+         print("前端收到：", item)
+ asyncio.run(main())
+ ```
