@@ -1,11 +1,39 @@
 # Agent 设计规范 
-- 定位
-- 核心组件
-- 关键 API
-## 一、
+- **定位**：Agent 执行中枢、ReAct 微内核状态机与转录本自愈引擎 ( `src/my_agent_core/agent.py` , `loop.py` , `tool_history.py` )
+- **核心组件**：
+    - `run_agent_loop`：无状态纯函数异步生成器微内核（约 110 行优雅状态机）
+    - `_assistant_turn` & `_execute_tools_turn`：专职子生成器车间
+    - `_provider_context` & `repair_tool_history`：上下文前置清洗与转录本自愈引擎
+    - `Agent`：轻量有状态外壳（`AgentHarness`），对外暴露 `prompt_stream` 一等公民事件流与 `subscribe` 观察者接口
+- **关键 API**：`agent.prompt_stream(user_input)`, `agent.run(user_input)`, `agent.subscribe(listener)`, `agent.steer(msg)`, `agent.follow_up(msg)`, `agent.abort()`
 
+## 一、架构设计
 
-## 二、微内核子生成器分治机制
+```text
+用户调用 agent.prompt_stream("...")
+        │
+        ▼
+┌─ Agent（外壳）──────────────────────────┐
+│  组装好组件，启动微内核                 │
+└────────────────┬────────────────────────┘
+                 │ 消费事件流
+                 ▼
+┌─ run_agent_loop（微内核）───────────────┐
+│  while True:                            │
+│    while 需要继续:                      │
+│      yield TurnStart                    │
+│      async for ev in _assistant_turn    │──▶ 车间①：调模型，流式吐事件
+│      async for ev in _execute_tools_turn│──▶ 车间②：跑工具，吐事件
+│      yield TurnEnd                      │
+│  yield AgentEnd                         │
+└─────────────────────────────────────────┘
+                 │
+                 ▼
+        事件流返回给调用方
+   （TUI 逐字渲染 / run() 提取 final_text）
+```
+
+## 二、微内核
 ### 1  专职模型推理车间： `_assistant_turn`
 - **流式增量与状态定型**： 首个 Chunk 到达时发射 `MessageStart(assistant)` ；在流式生成中逐字发射 `MessageUpdate` 驱动终端打字机；流式结束时直接接收模型边界层交付的完整 `Response` 实体，发射 `MessageEnd` 定型。
 
@@ -219,22 +247,22 @@ asyncio.run(main())
 目前想实现的功能伪代码如下（当前代码没有报错，不清楚什么原因）：
 ```python
 async def main():
-	queue = asyncio.Queue()
-	errors = []
-	
-	def worker():
-		try:
-			queue.put({"from": threading.current_thread()})
-		except Exception as e:
-			errors.append(e)
-			print("catch exception", e)
-	
-	threads = [threading.Thread(target=worker) for i in range(10)]
-	for t in threads: t.start()
-	for t in threads: t.join()
-	
-	print(errors)
-	print("queue.qsize() = "queue.qsize())
+    queue = asyncio.Queue()
+    errors = []
+
+    def worker():
+        try:
+            queue.put({"from": threading.current_thread()})
+        except Exception as e:
+            errors.append(e)
+            print("catch exception", e)
+
+    threads = [threading.Thread(target=worker) for i in range(10)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    print(errors)
+    print("queue.qsize() =", queue.qsize())
 
 asyncio.run(main())
 ```
@@ -277,3 +305,211 @@ import asyncio
          print("前端收到：", item)
  asyncio.run(main())
  ```
+
+3. **冲突 3 解释： 防止协程一直等待队列任务** 
+目前想实现的伪代码如下：
+```python
+async def _execute_tools_turn():
+	task = async.create_task(run_tools(queue))
+	while True:
+		item = await queue.get()
+		yield item
+```
+
+   矛盾的根源：**前台一直需要一直监听 `queue` ，如果监听不到就会一直卡在 `await queue.get()` **。
+   **作者的解决方式**：设置哨兵 **sentinel**
+```python
+async def _execute_tools_turn():
+    queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    async def worker():
+        result = await asyncio.gather(
+            run_tool("tool_a", queue, loop),
+            run_tool("tool_b", queue, loop),
+        )
+        await queue.put({"done": True, "result": result})
+    asyncio.create_task(worker())
+    while True:
+        item = await queue.get()
+        if item.get("done"):                 #设置哨兵 sentinel, 如果item里面发现有完成, 就跳出循环
+            yield item["result"]
+            break
+        yield item
+```
+
+## 三、上下文清洗与转录本自愈
+大模型提供商（如 OpenAI、Anthropic）对上下文格式有着极其严苛的校验规则：
+
+- **禁止悬空断头调用**：Assistant 发起了 `tool_calls` ，后面必须紧随对应 ID 的 `tool` 消息，否则直接报 API 400；
+- **禁止孤儿结果**：没有对应 `tool_calls` 的 `role="tool"` 消息会被拒绝；
+- **禁止空失败轮次**：以 `stop_reason="error"` 结尾且 `content=""` 的中断消息会导致上下文语法错误。
+
+1. `_provider_context` 前置清洗
+在每次向大模型发送消息列表前，微内核自动执行 `_provider_context(messages)` ：
+	1. 剔除无正文且以异常中断结尾的终端 assistant 失败轮次；
+	2. 串联 `repair_tool_history` 进行转录本拓扑自愈。
+
+> 流程是 `message` -> `_provider_context()` -> x -> `repair_tool_history()` -> repaired `message`
+> 删除的典型消息 `{"role": "assistant", "content": "", "stop_reason": "error"}`
+
+2. `repair_tool_history` 三阶段确定性状态机
+
+```text
+原始乱序/断头消息
+       │
+       ▼ Phase 1 (建立索引): 收集所有 Assistant 节点的 tool_calls 声明
+       ▼ Phase 2 (孤儿与重复清洗): 从后往前扫描，丢弃无主结果与重复结果
+       ▼ Phase 3 (重排与断头补齐): 严格按 Assistant 声明顺序重排 Tool 消息，
+                                  对缺失结果的断头调用自动合成
+                                  role="tool", content="Tool call interrupted by user"
+       │
+       ▼
+格式 100% 严谨合法的消息历史 (免疫任何 LLM API 400 校验死锁)
+```
+
+> 
+
+## 四、Agent Harness
+`Agent` 类蜕变为轻量外壳，负责生命周期资源的组装与管理：
+
+1. 一等公民事件流： `prompt_stream`
+
+调用方可以直接以异步迭代器的方式消费微内核发射的每一个纯只读事件：
+
+```python
+agent = Agent(llm=llm, tools=[...])
+
+async for event in agent.prompt_stream("帮我重构这个模块"):
+    if isinstance(event, MessageUpdate):
+        print(event.chunk.content, end="", flush=True)
+    elif isinstance(event, ToolExecutionStart):
+        print(f"\n[Tool Start] {event.tool_name} with {event.args}")
+    elif isinstance(event, AgentEnd):
+        print(f"\n[Finished] Total iterations: {event.iterations}")
+```
+
+> `MessageUpdate` 对应 `_assistant_turn` 中实现流式输出 Chunk
+> `ToolExecutionStart` 对应 `_execute_tools_turn` 中执行工具 Tool
+
+2. 观察者模式： `subscribe` 与 `_notify` 广播管道
+
+对标 Pi 的 `AgentSession.subscribe` 与 Tau 的 `AgentHarness.subscribe`，`Agent` 实现了轻量只读观察者管道：
+
+```python
+# 注册监听器（返回注销句柄）
+unsubscribe = agent.subscribe(lambda event: print(f"Audit log: {type(event).__name__}"))
+
+# 业务注销（零内存泄露隐患）
+unsubscribe()
+```
+
+> 类比理解为数据库连接 `conn = sqlite3.connect("db.sqlite")` ，然后通过句柄 `conn` 注销 `conn.close()`
+
+核心实现不变式（ `Agent._notify` ）
+
+1. **快照遍历（Snapshot Iteration）**：使用 `for sub in list(self._subscribers)` 遍历快照，防止回调函数在执行中反注册导致的遍历变异竞态；
+> **防坑：** 实际上快照 snapshot 指的是 `list()` ，因为如果直接调 `self._subscribers` ，在遍历过程中列表 `self._subscribers` 发生改变，运行时可能出现 `RuntimeError: list changed size during iteration` 错误
+
+2. **异常隔离（Never-Throw Guarantee）**：使用 `with contextlib.suppress(Exception):` 隔离监听器异常，旁路订阅者的任何错误绝对不会中断主循环；
+> **防坑：** 如果监听器内部出现异常 （写入 `0/1` ），那么 `_notify` -> Agent 整段跨掉，而 `suppress(Exception)` 就是为了拒绝监听器的异常，这段设计也符合整个项目中的架构不变式**Never-Throw Guarantee**
+
+3. **同异步自适应（Adaptive Dispatch）**： `if inspect.isawaitable(res): await res` ，无论监听器写成同步 `def` 还是异步 `async def` 均能无缝等待；
+> **防坑：** 有的监听器被写成 `def sync_fun()` ，有的被写成 `async def async_fun()` ，同时有同步函数和异步函数，统一 `await` 或统一不 `await` 会报错， `await sync_fun()` 抛出 `object NoneType can't be used in 'await' expression` ， `async_fun()` 抛出 `RuntimeWarning: Enable tracemalloc to get the object allocation traceback` ，具体我们可以看以下例子：
+
+```python
+import asyncio
+import inspect
+
+def sync_fun(event):
+    print(f"[sync] received {event}")
+async def async_fun(event):
+    await asyncio.sleep(0.5)
+    print(f"[async] received {event}")
+
+async def f_all_await(subs=[sync_fun, async_fun], event="?"):
+    for sub in subs:
+        await sub(event)
+async def f_no_await(subs=[sync_fun, async_fun], event="?"):
+    for sub in subs:
+        sub(event)
+async def f_adaptive_await(subs=[sync_fun, async_fun], event="?"):
+    for sub in subs:
+        res = sub(event)
+        if inspect.isawaitable(res):
+            await res
+
+async def main():
+    try: await f_all_await()
+    except Exception as e: print(e)
+    await asyncio.sleep(0.5)
+
+    print("=" * 30)
+    await f_no_await()
+    await asyncio.sleep(0.5)
+
+    print("=" * 30)
+    await f_adaptive_await()
+
+asyncio.run(main())
+```
+
+4. **注销令牌（Teardown Token）**： `subscribe` 返回闭包句柄，通过对象引用精确定位移除，消除索引耦合；
+> **防坑：** 如果返回索引，假如 3 号订阅者注销，下一个订阅者是 3 号还是 4 号呢？不过这个解释真的有力吗？这个防坑可能从句柄的设计意义上来说，还是说当前项目只涉及了索引吗？
+
+5. **全触点覆盖**：在 `UserInputHook` 阻断退出、 `AgentStartHook` 阻断退出、 `prompt_stream` 主事件循环、以及上下文压缩写回 4 大触点统一触发广播。
+> **防坑：** 如果只在 `prompt_stream` 主事件循环中广播，那么在其他阶段没有办法退出了，得保证监听器在任意阶段都可以收到结束信号
+
+
+3. 便利门面： `run`
+经典阻塞式调用，内部纯粹消费 `prompt_stream` 并在 `AgentEnd` 时提取 `final_text` 返回：
+
+```python
+async def run(self, user_input: str) -> str | None:
+    final_text = None
+    async for event in self.prompt_stream(user_input):
+        if isinstance(event, AgentEnd):
+            final_text = event.final_text
+    return final_text
+```
+
+> 这里不清楚为什么单独提出 `run` ，难道不是在 `一等公民事件流` 中已经介绍过了吗？
+
+4. 协作式中断： `abort`
+通过 `agent.abort()` 触发内部 `CancellationToken.cancel()` ，流式推理与工具执行车间将在下一个检查点安全终止，并完成断头结果自动合成与原子落盘，**绝不向 Session 写入半截脏数据**。
+
+> 设计目的：使得系统能干净、安全地停下来，不泄露资源或者操作执行一半
+> **中断流程：** `agent.abort()` 调用 `CancellationToken.cancel()` 协作式地取消进程，实际上是通知各个环节释放结束信号
+> - 专职模型推理车间 `_assistant_turn` ：
+> 	- **智能退避重试体系 ( `AutoRetryPolicy` )** 中设计了 `CancellationToken.is_cancelled()` 检查
+> 	- 应该各个环节都涉及了，比如调用模型后检查、Chunk 到达后检查，文档没有描述应该在代码部分
+> - 专职工具执行车间 `_execute_tools_turn` ：
+> 	- **断头结果自动合成** 中假如模型正在执行工具 `[tool_a, tool_b, tool_c]` ，当前执行情况如下所示 `tool_a - completed` ， `tool_b - working` ， `tool_c - pending` 。如果直接中断应该为 `tool_b` 和 `tool_c` 补全工具结果，因为要符合消息合法性，添加诸如 `Tool_Message(content = "Tool is cancelled by user", tool_id = "tool_b")` 形式的信息。
+> 	- **原子落盘** 中假如模型正在执行工具 `write_file` 而且执行了一半，要么全写要么全不写，其实现方式是 `Path(f"{tmp}.txt").write_text("...")` -> `fsync(f"{tmp}.txt")` ->  `os.replace(f"{tmp}.txt", f"{target}.txt")`
+> 	
+> 以下是 `abort` 的完整流程
+
+```text
+用户按 Esc
+    │
+    ▼
+agent.abort()
+    │
+    ▼
+CancellationToken.cancel()   ← 设置取消标志
+    │
+    ▼
+当前操作走到下一个检查点
+    │
+    ├─ 流式推理：停止接收 chunk，发射 MessageEnd（标记 cancelled）
+    │
+    └─ 工具执行：停止后续工具，补齐断头结果
+    │
+    ▼
+收尾三件事：
+    1. 合成缺失的 ToolMessage
+    2. 原子落盘会话
+    3. 校验历史合法性
+    │
+    ▼
+安全退出，历史可继续使用
+```
