@@ -5,7 +5,27 @@
 
 ## 一、架构设计与定位
 
-> 下面读完再来看这一段
+工具系统是 Agent 与外部物理环境交互的手和脚。 `my-agent-core` 的工具系统深度对标 **Tau** 与 **Pi** 的微内核设计，强调四大核心设计不变式：
+
+1. **自动提取契约**：基于 Pydantic v2 从 Python 函数签名动态提取标准化 Function Calling Schema；
+2. **结构化 ToolCall 第一公民**：在模型边界层完成参数反序列化，微内核与注册表原生消费字典（ `args: dict` ），**彻底消灭 4 重 JSON 编解码死循环（4x JSON Ping-Pong）**；
+3. **Never-Throw 强稳定性保证**：任何参数校验失败或业务执行异常，统一包装为结构化错误引导 LLM 自我修正，绝不让异常崩溃蔓延至主循环；
+4. **并发批执行与因果时序保护**：支持声明式 `is_parallel_safe` 并发加速，并引入“一票否决”严格因果时序降级与保序回填机制。
+
+```text
+       普通 Python 函数 / 远程 MCP 工具
+                     │
+                     ▼
+         @tool 包装 或 Tool(raw_schema=...)
+                     │
+                     ▼
+             Tool 实体实例
+      (to_openai_schema / execute)
+                     │
+                     ▼
+               ToolRegistry
+  (register / execute_tool / execute_batch / get_schemas)
+```
 
 ## 二、核心类与机制
 ### 1. 结构化 `ToolCall` 实体（一等公民）
@@ -283,6 +303,7 @@ class ToolResult:
 > print(res)
 > ```
 > **微观**应该是说主线程中再调用多个子线程，我们看 `threading.Thread(target=fun)` 和 `asyncio.gather(asyncio.to_thread(fun))` 这两种做法，不过 `threading.Thread(target=fun)` 的方式无法获得返回值，并且 `join()` 会阻塞等待；而 `asyncio.to_thread(fun)` 是将函数交给线程池，可以获得返回值。此处可以去看 `03-agent-loop.md` 中的描述，具体如何实现的
+> 
 > **以下是 `threading.Thread(target=fun)` **
 > ```python
 > import threading  
